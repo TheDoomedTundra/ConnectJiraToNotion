@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-
-import json
-import logging
-import os
-import requests
-import sys
-
 import JiraApi
 
 if __name__ == '__main__':
