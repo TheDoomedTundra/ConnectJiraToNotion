@@ -5,8 +5,7 @@ from RestApiBase import *
 class JiraApi(ApiBase):
     def __init__(self, file_path):
         # Make sure URL does not end with /
-        api_url = "https://jira.mathworks.com/rest/api/2"
-        super().__init__(file_path, api_url)
+        super().__init__(file_path)
 
     def query_issue(self, method, id_or_key, resource='', fields=[], expand=[]):
         url = self.build_url(f"issue/{id_or_key}/{resource}")
@@ -31,72 +30,80 @@ class JiraApi(ApiBase):
         response = self.send_query("GET", url, params=query)
         return response.json()
     
-# Use Composition for JiraIssues since it has a Jira API, but it's purpose is processing. 
-# Have subtasks inherit from issues
-class JiraIssues():
+# Have JiraPull and JiraPush inherit, have JiraIssues process with composition
+class JiraPull(JiraApi):
+    story_query = 'issuetype = Story AND resolution = Unresolved AND assignee in (currentUser()) ' \
+            'AND NOT (status in ("10000", "10406", "10001", "3", "10401", "10400") ' \
+            'AND issuetype != "10000" AND status not in ("10001") AND (cf[10004] is EMPTY ' \
+            'OR cf[10004] not in futureSprints() AND cf[10004] not in openSprints())) ORDER BY key ASC'
+
     def __init__(self, file_path):
-        self.api = JiraApi(file_path)
+        super().__init__(file_path)
         self.issue_fields = ["issuetype", "summary", "status", "subtasks", "worklog"]
         self.expand = ["changelog"]
 
-    def get_open_issues(self, query):
-        data = self.api.send_jql_query(query, self.issue_fields, self.expand)
+    def get_open_issues(self, query=story_query):
+        data = self.send_jql_query(query, self.issue_fields, self.expand)
         issues = data['issues']
 
+        issues = self.get_subtasks_for_issues(issues)
         return issues
-
-    def get_worklog(self, issue_id):
-        worklogs = self.api.query_issue("GET", issue_id, "worklog")
-
-        time_spent = 0
-        for log in worklogs["worklogs"]:
-            time_spent += log["timeSpentSeconds"]
-
-        return time_spent
     
-    def process_worklog(self, worklogs):
-        time_spent = 0
-        for log in worklogs["worklogs"]:
-            time_spent += log["timeSpentSeconds"]
-
-        return time_spent
+    def get_subtasks_for_issues(self, issues):
+        for issue in issues:
+            subtasks = issue["fields"]["subtasks"]
+            for i, subtask in enumerate(subtasks):
+                subtask_issue = self.query_issue("GET", subtask["id"])
+                subtasks[i] = subtask_issue
+        return issues
+        
     
-    def process_issue(self, issue):
-        issue_type = issue["fields"]["issuetype"]["name"]
+class JiraIssues():
+    def __init__(self) -> None:
+        pass
+
+    @staticmethod
+    def process_issue(issue):
+        fields = issue["fields"]
+        issue_type = fields["issuetype"]["name"]
 
         issue_data = {
             "type": issue_type,
-            "summary": issue["fields"]["summary"],
-            "status": issue["fields"]["status"]["name"],
+            "summary": fields["summary"],
+            "status": fields["status"]["name"],
             "id": issue["id"],
-            "worklogs": self.process_worklog(issue["fields"]["worklog"]), # TODO: Doesn't work for sub-tasks
-            "lastupdated": issue["changelog"]["histories"][-1]["created"],
+            "worklogs": JiraIssues.process_worklog(fields["worklog"]),
+            "lastupdated": None,
             "subtasks": {}
         }
 
-        if (issue_type != "Sub-task" and "subtasks" in issue["fields"]):
-            num_subtasks = len(issue["fields"]["subtasks"])
-            j = 1
-            for subtask in issue["fields"]["subtasks"]:
-                print(f"Processing subtask {j} of {num_subtasks}")
-                issue = self.api.query_issue("GET", subtask["id"])
-                subtask_data = self.process_issue(issue)
-                j += 1
+        if issue_type == "Story":
+            last_update = issue["changelog"]["histories"][-1]["created"]
+            for subtask in fields["subtasks"]:
+                subtask_data = JiraIssues.process_issue(subtask)
                 issue_data["subtasks"][subtask["key"]] = subtask_data
+        else:
+            last_update = fields["updated"]
+
+        issue_data["lastupdated"] = last_update
 
         return issue_data
 
-    def build_issue_key_map(self, issues):
+    @staticmethod
+    def build_issue_key_map(issues):
         issue_map = {}
-        num_issues = len(issues)
-        i = 1
         for issue in issues:
             # Map issue keys to issue objects
             issue_key = issue["key"]
-            print(f"Processing issue {i} of {num_issues}")
-            i += 1
-            issue_data = self.process_issue(issue)
-            
+            issue_data = JiraIssues.process_issue(issue)
             issue_map[issue_key] = issue_data
         
         return issue_map
+    
+    @staticmethod
+    def process_worklog(worklog):
+        time_spent = 0
+        for log in worklog["worklogs"]:
+            time_spent += log["timeSpentSeconds"]
+
+        return time_spent
